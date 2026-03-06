@@ -127,7 +127,7 @@ class EventStreamingHook:
 
         if event == "tool:pre":
             return {
-                "type": "tool_call",
+                "type": "tool_pre",
                 "tool_name": data.get("tool_name"),
                 "tool_call_id": data.get("tool_call_id"),
                 "arguments": data.get("arguments"),

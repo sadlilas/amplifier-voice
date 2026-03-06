@@ -12,20 +12,39 @@ Ported from the voice app in [amplifier-distro](https://github.com/payneio/ampli
 
 ## Quick Start
 
-### Option 1: Install as a tool (recommended)
+### Option 1: Install from GitHub (recommended)
 
 ```bash
-uv tool install git+https://github.com/payneio/amplifierd \
+uv tool install amplifierd \
+  --from git+https://github.com/payneio/amplifierd \
   --with git+https://github.com/robotdad/amplifierd-voice
 
 amplifierd serve
 ```
 
-This installs amplifierd and the voice plugin into the same environment. The plugin is auto-discovered via Python entry points — no configuration needed.
+This installs amplifierd and the voice plugin into the same tool environment. The plugin is auto-discovered via Python entry points — no configuration needed.
 
-### Option 2: Wrapper project (like amplifier-experience)
+### Option 2: Editable install for development
 
-Create a `pyproject.toml` that composes amplifierd + voice:
+Install amplifierd from GitHub with the voice plugin editable from a local checkout. Source changes to the voice plugin take effect on server restart — no reinstall needed.
+
+```bash
+git clone https://github.com/robotdad/amplifierd-voice
+cd amplifierd-voice
+
+uv tool install amplifierd \
+  --from git+https://github.com/payneio/amplifierd \
+  --with-editable . \
+  --force
+
+amplifierd serve
+```
+
+To update amplifierd to the latest version while keeping the voice plugin editable, re-run the same command with `--force`.
+
+### Option 3: Wrapper project
+
+Create a `pyproject.toml` that composes amplifierd + voice into a named tool:
 
 ```toml
 [project]
@@ -46,26 +65,6 @@ Then:
 ```bash
 uv tool install .
 amplifierd-voice serve
-```
-
-### Option 3: Local development
-
-```bash
-git clone https://github.com/robotdad/amplifierd-voice
-cd amplifierd-voice
-uv sync --all-extras
-
-# Run with amplifierd from a sibling directory
-cd ../amplifierd
-uv run --with ../amplifierd-voice amplifierd serve
-```
-
-For editable local development with both repos side by side, add a `[tool.uv.sources]` override in your wrapper project:
-
-```toml
-[tool.uv.sources]
-amplifierd = { path = "../amplifierd", editable = true }
-amplifierd-plugin-voice = { path = "../amplifierd-voice", editable = true }
 ```
 
 ## Configuration

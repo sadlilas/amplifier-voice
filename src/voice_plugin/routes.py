@@ -332,6 +332,9 @@ def create_session_routes(
             )
         conn._handle = handle
 
+        # Re-register spawn with event forwarding for delegation UI
+        conn._register_spawn_with_forwarding()
+
         # Start event forwarding for the resumed session
         conn._subscription_task = asyncio.create_task(conn._forward_events(session_id))
         _active_connection = conn
