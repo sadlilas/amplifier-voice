@@ -32,7 +32,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from voice_plugin.config import VoicePluginSettings, get_voice_config
+from voice_plugin.config import VoicePluginSettings, get_instructions, get_voice_config
 from voice_plugin.connection import VoiceConnection
 from voice_plugin.transcript.models import TranscriptEntry, VoiceConversation
 from voice_plugin.transcript.repository import VoiceConversationRepository
@@ -147,7 +147,7 @@ def create_signaling_routes(settings: VoicePluginSettings) -> APIRouter:
         config = rt.VoiceConfig(
             model=vcfg["model"],
             voice=vcfg["voice"],
-            instructions=vcfg["instructions"],
+            instructions=get_instructions(vcfg),
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
         )
         result = await rt.create_client_secret(config)
@@ -313,7 +313,7 @@ def create_session_routes(
         config = rt.VoiceConfig(
             model=vcfg["model"],
             voice=vcfg["voice"],
-            instructions=vcfg["instructions"],
+            instructions=get_instructions(vcfg),
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
         )
         secret_result = await rt.create_client_secret(config)

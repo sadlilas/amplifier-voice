@@ -713,7 +713,7 @@ body {
   // useWebRTC({ onMessage, onStateChange })
   // -------------------------------------------------------------------------
 
-  function useWebRTC({ onMessage, onStateChange }) {
+  function useWebRTC({ onMessage, onStateChange, onIceStateChange }) {
     const [rtcState, setRtcState] = useState('idle');
     const [secureContextError, setSecureContextError] = useState(false);
     const pcRef = useRef(null);
@@ -893,6 +893,7 @@ body {
       pc.oniceconnectionstatechange = () => {
         const iceState = pc.iceConnectionState;
         console.debug('[useWebRTC] ICE connection state:', iceState);
+        if (onIceStateChange) onIceStateChange(iceState);
         if (iceState === 'connected' || iceState === 'completed') {
           updateState('connected');
         } else if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
@@ -1320,9 +1321,18 @@ body {
   // useConnectionHealth({ manager, onProactiveReconnect })   Task 5.5
   // -------------------------------------------------------------------------
 
-  function useConnectionHealth({ manager, onProactiveReconnect }) {
+  function useConnectionHealth({ manager, onProactiveReconnect, reconnectionConfig = {} }) {
     const [status, setStatus] = useState(null);
+    const [isMonitoring, setIsMonitoring] = useState(false);
     const onProactiveRef = useRef(onProactiveReconnect);
+    const lastStaleWarnRef = useRef(null);
+    const autoDelayTimerRef = useRef(null);
+
+    const {
+      strategy,                   // overrides manager.strategy when provided
+      autoReconnectDelayMs = 3000,
+      maxReconnectAttempts = 5,
+    } = reconnectionConfig;
 
     // Keep ref current on every render so the interval callback sees latest fn
     useEffect(() => {
@@ -1332,27 +1342,75 @@ body {
     useEffect(() => {
       if (!manager) return;
 
+      setIsMonitoring(true);
+
       const tick = () => {
         const s = manager.getStatus();
         setStatus(s);
 
-        // Proactive strategy: trigger reconnect before the 60-min session limit
+        // Guard: max reconnect attempts
+        if (manager.reconnectCount >= maxReconnectAttempts) return;
+
+        const effectiveStrategy = strategy || manager.strategy;
+
+        // Proactive: trigger reconnect before the 60-min session limit
         if (
           s.warnings.includes('session_limit') &&
-          manager.strategy === 'proactive' &&
+          effectiveStrategy === 'proactive' &&
           onProactiveRef.current
         ) {
           onProactiveRef.current();
+        }
+
+        // Auto immediate: reconnect right away when disconnected
+        if (
+          s.healthStatus === 'disconnected' &&
+          effectiveStrategy === 'auto_immediate' &&
+          onProactiveRef.current
+        ) {
+          onProactiveRef.current();
+        }
+
+        // Auto delayed: reconnect after a short delay when disconnected
+        if (
+          s.healthStatus === 'disconnected' &&
+          effectiveStrategy === 'auto_delayed' &&
+          onProactiveRef.current &&
+          !autoDelayTimerRef.current
+        ) {
+          autoDelayTimerRef.current = setTimeout(() => {
+            autoDelayTimerRef.current = null;
+            if (onProactiveRef.current) onProactiveRef.current();
+          }, autoReconnectDelayMs);
+        }
+
+        // Rate-limit stale connection console warnings to once per 30s
+        if (s.warnings.includes('stale')) {
+          const now = Date.now();
+          const timeSinceLastWarn = lastStaleWarnRef.current
+            ? now - lastStaleWarnRef.current
+            : Infinity;
+          if (timeSinceLastWarn >= 30000) {
+            lastStaleWarnRef.current = now;
+            console.warn('[useConnectionHealth] Stale connection detected');
+          }
         }
       };
 
       // Immediate snapshot, then every 5 s
       tick();
       const id = setInterval(tick, 5000);
-      return () => clearInterval(id);
-    }, [manager]);
+      return () => {
+        clearInterval(id);
+        if (autoDelayTimerRef.current) {
+          clearTimeout(autoDelayTimerRef.current);
+          autoDelayTimerRef.current = null;
+        }
+        setIsMonitoring(false);
+      };
+    }, [manager, strategy, autoReconnectDelayMs, maxReconnectAttempts]);
 
-    return status;
+    return { status, isMonitoring };
   }
 
   // -------------------------------------------------------------------------
@@ -1367,12 +1425,21 @@ body {
     return `${m}m ${s % 60}s`;
   }
 
+  // Map health status to a display color
+  const HEALTH_STATUS_COLORS = {
+    healthy:      '#22c55e',
+    warning:      '#f59e0b',
+    critical:     '#ef4444',
+    disconnected: '#6b7280',
+  };
+
   function ConnectionHealthPanel({ status, strategy, onStrategyChange }) {
     const [expanded, setExpanded] = useState(false);
 
     if (!status) return null;
 
-    const { sessionAge, timeSinceEvent, reconnectCount, warnings } = status;
+    const { sessionAge, timeSinceEvent, reconnectCount, warnings, healthStatus } = status;
+    const dotColor = HEALTH_STATUS_COLORS[healthStatus] || HEALTH_STATUS_COLORS.disconnected;
 
     return html`
       <div class="health-panel">
@@ -1382,6 +1449,11 @@ body {
           aria-expanded=${expanded}
         >
           <span class="health-panel-header-left">
+            <span
+              class="health-status-dot"
+              style=${{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', background: dotColor, marginRight: '6px', flexShrink: 0 }}
+              title=${healthStatus || 'unknown'}
+            ></span>
             <span>🥪 Connection Health</span>
             ${warnings.length > 0 && html`
               <span class="health-badges">
@@ -1394,6 +1466,10 @@ body {
 
         ${expanded && html`
           <div class="health-panel-body">
+            <div class="health-row">
+              <span class="health-label">Status</span>
+              <span class="health-value" style=${{ color: dotColor, fontWeight: 600 }}>${healthStatus || '—'}</span>
+            </div>
             <div class="health-row">
               <span class="health-label">Session age</span>
               <span class="health-value">${fmtDuration(sessionAge)}</span>
@@ -1913,7 +1989,7 @@ body {
     const handleResumeRef = useRef(null);
 
     // Task 5.5: poll connection health every 5s
-    const healthStatus = useConnectionHealth({
+    const { status: healthStatus } = useConnectionHealth({
       manager: healthManagerRef.current,
       onProactiveReconnect: useCallback(() => {
         console.debug('[VoiceApp] Proactive reconnect triggered by session_limit warning');
@@ -1960,11 +2036,21 @@ body {
 
     const handleStateChange = useCallback((state) => {
       console.debug('[VoiceApp] RTC state changed:', state);  // Task 5.3
+      // End session on unexpected disconnect (ICE failure, network drop, etc.)
+      if (state === 'disconnected' && healthManagerRef.current) {
+        const reason = healthManagerRef.current.analyzeDisconnectReason();
+        healthManagerRef.current.endSession(reason);
+      }
     }, []);
 
     const { rtcState, secureContextError, connect, disconnect, sendDataChannelMessage, streamRef } = useWebRTC({
       onMessage: stableMsgHandler,
       onStateChange: handleStateChange,
+      onIceStateChange: useCallback((iceState) => {
+        if (healthManagerRef.current) {
+          healthManagerRef.current.recordConnectionState(iceState);
+        }
+      }, []),
     });
 
     // Task 5.4: microphone mute + pause-replies control
@@ -2191,6 +2277,10 @@ body {
     }, [connect, disconnect, setMicStream, streamRef]);
 
     const handleDisconnect = useCallback(async () => {
+      // Record user-initiated disconnect before tearing down
+      if (healthManagerRef.current) {
+        healthManagerRef.current.endSession('user_initiated');
+      }
       // Sync any remaining transcript entries before tearing down the session
       // so the last few messages are persisted even on a clean disconnect.
       await syncTranscript();
