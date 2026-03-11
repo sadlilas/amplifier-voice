@@ -661,6 +661,18 @@ body {
   border-color: var(--warning);
 }
 
+.btn-respond {
+  background: var(--signal-soft);
+  color: var(--signal);
+  border: 1px solid var(--signal);
+  flex: 1;
+}
+
+.btn-respond:hover:not(:disabled) {
+  background: var(--signal);
+  color: #fff;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Secure-context error banner                                       */
 /* ------------------------------------------------------------------ */
@@ -713,7 +725,7 @@ body {
   // useWebRTC({ onMessage, onStateChange })
   // -------------------------------------------------------------------------
 
-  function useWebRTC({ onMessage, onStateChange }) {
+  function useWebRTC({ onMessage, onStateChange, onIceStateChange }) {
     const [rtcState, setRtcState] = useState('idle');
     const [secureContextError, setSecureContextError] = useState(false);
     const pcRef = useRef(null);
@@ -748,7 +760,7 @@ body {
         const resp = await fetch('/voice/session');
         if (!resp.ok) throw new Error(`Session token fetch failed: ${resp.status}`);
         const data = await resp.json();
-        token = data.value;
+        token = data.client_secret.value;
       } catch (err) {
         console.error('[useWebRTC] Failed to fetch session token:', err);
         updateState('disconnected');
@@ -849,6 +861,21 @@ body {
         };
         dc.send(JSON.stringify(sessionConfig));
 
+        // Send retention ratio truncation config.  When the context window
+        // fills, the oldest (1 - ratio) portion is dropped in one chunk.
+        // This enables long-running sessions without manual truncation.
+        const truncationConfig = {
+          type: 'session.update',
+          session: {
+            type: 'realtime',
+            truncation: {
+              type: 'retention_ratio',
+              retention_ratio: 0.8,
+            },
+          },
+        };
+        dc.send(JSON.stringify(truncationConfig));
+
         // Inject resume context items into the Realtime API session (non-empty on
         // resume only). Sent after session.update so config is already in place.
         // A response.create follows so the model can greet the user with context.
@@ -878,6 +905,7 @@ body {
       pc.oniceconnectionstatechange = () => {
         const iceState = pc.iceConnectionState;
         console.debug('[useWebRTC] ICE connection state:', iceState);
+        if (onIceStateChange) onIceStateChange(iceState);
         if (iceState === 'connected' || iceState === 'completed') {
           updateState('connected');
         } else if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
@@ -917,6 +945,9 @@ body {
           body: pc.localDescription.sdp,
         });
         if (!sdpResp.ok) throw new Error(`SDP exchange failed: ${sdpResp.status}`);
+        // Extract call_id from custom header (identifies the WebRTC call)
+        const callId = sdpResp.headers.get('X-Call-Id') || '';
+        if (callId) console.debug('[useWebRTC] call_id:', callId);
         sdpAnswer = await sdpResp.text();
       } catch (err) {
         console.error('[useWebRTC] SDP exchange failed:', err);
@@ -1302,9 +1333,18 @@ body {
   // useConnectionHealth({ manager, onProactiveReconnect })   Task 5.5
   // -------------------------------------------------------------------------
 
-  function useConnectionHealth({ manager, onProactiveReconnect }) {
+  function useConnectionHealth({ manager, onProactiveReconnect, reconnectionConfig = {} }) {
     const [status, setStatus] = useState(null);
+    const [isMonitoring, setIsMonitoring] = useState(false);
     const onProactiveRef = useRef(onProactiveReconnect);
+    const lastStaleWarnRef = useRef(null);
+    const autoDelayTimerRef = useRef(null);
+
+    const {
+      strategy,                   // overrides manager.strategy when provided
+      autoReconnectDelayMs = 3000,
+      maxReconnectAttempts = 5,
+    } = reconnectionConfig;
 
     // Keep ref current on every render so the interval callback sees latest fn
     useEffect(() => {
@@ -1314,27 +1354,75 @@ body {
     useEffect(() => {
       if (!manager) return;
 
+      setIsMonitoring(true);
+
       const tick = () => {
         const s = manager.getStatus();
         setStatus(s);
 
-        // Proactive strategy: trigger reconnect before the 60-min session limit
+        // Guard: max reconnect attempts
+        if (manager.reconnectCount >= maxReconnectAttempts) return;
+
+        const effectiveStrategy = strategy || manager.strategy;
+
+        // Proactive: trigger reconnect before the 60-min session limit
         if (
           s.warnings.includes('session_limit') &&
-          manager.strategy === 'proactive' &&
+          effectiveStrategy === 'proactive' &&
           onProactiveRef.current
         ) {
           onProactiveRef.current();
+        }
+
+        // Auto immediate: reconnect right away when disconnected
+        if (
+          s.healthStatus === 'disconnected' &&
+          effectiveStrategy === 'auto_immediate' &&
+          onProactiveRef.current
+        ) {
+          onProactiveRef.current();
+        }
+
+        // Auto delayed: reconnect after a short delay when disconnected
+        if (
+          s.healthStatus === 'disconnected' &&
+          effectiveStrategy === 'auto_delayed' &&
+          onProactiveRef.current &&
+          !autoDelayTimerRef.current
+        ) {
+          autoDelayTimerRef.current = setTimeout(() => {
+            autoDelayTimerRef.current = null;
+            if (onProactiveRef.current) onProactiveRef.current();
+          }, autoReconnectDelayMs);
+        }
+
+        // Rate-limit stale connection console warnings to once per 30s
+        if (s.warnings.includes('stale')) {
+          const now = Date.now();
+          const timeSinceLastWarn = lastStaleWarnRef.current
+            ? now - lastStaleWarnRef.current
+            : Infinity;
+          if (timeSinceLastWarn >= 30000) {
+            lastStaleWarnRef.current = now;
+            console.warn('[useConnectionHealth] Stale connection detected');
+          }
         }
       };
 
       // Immediate snapshot, then every 5 s
       tick();
       const id = setInterval(tick, 5000);
-      return () => clearInterval(id);
-    }, [manager]);
+      return () => {
+        clearInterval(id);
+        if (autoDelayTimerRef.current) {
+          clearTimeout(autoDelayTimerRef.current);
+          autoDelayTimerRef.current = null;
+        }
+        setIsMonitoring(false);
+      };
+    }, [manager, strategy, autoReconnectDelayMs, maxReconnectAttempts]);
 
-    return status;
+    return { status, isMonitoring };
   }
 
   // -------------------------------------------------------------------------
@@ -1349,12 +1437,21 @@ body {
     return `${m}m ${s % 60}s`;
   }
 
+  // Map health status to a display color
+  const HEALTH_STATUS_COLORS = {
+    healthy:      '#22c55e',
+    warning:      '#f59e0b',
+    critical:     '#ef4444',
+    disconnected: '#6b7280',
+  };
+
   function ConnectionHealthPanel({ status, strategy, onStrategyChange }) {
     const [expanded, setExpanded] = useState(false);
 
     if (!status) return null;
 
-    const { sessionAge, timeSinceEvent, reconnectCount, warnings } = status;
+    const { sessionAge, timeSinceEvent, reconnectCount, warnings, healthStatus } = status;
+    const dotColor = HEALTH_STATUS_COLORS[healthStatus] || HEALTH_STATUS_COLORS.disconnected;
 
     return html`
       <div class="health-panel">
@@ -1364,6 +1461,11 @@ body {
           aria-expanded=${expanded}
         >
           <span class="health-panel-header-left">
+            <span
+              class="health-status-dot"
+              style=${{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', background: dotColor, marginRight: '6px', flexShrink: 0 }}
+              title=${healthStatus || 'unknown'}
+            ></span>
             <span>🥪 Connection Health</span>
             ${warnings.length > 0 && html`
               <span class="health-badges">
@@ -1376,6 +1478,10 @@ body {
 
         ${expanded && html`
           <div class="health-panel-body">
+            <div class="health-row">
+              <span class="health-label">Status</span>
+              <span class="health-value" style=${{ color: dotColor, fontWeight: 600 }}>${healthStatus || '—'}</span>
+            </div>
             <div class="health-row">
               <span class="health-label">Session age</span>
               <span class="health-value">${fmtDuration(sessionAge)}</span>
@@ -1409,52 +1515,88 @@ body {
 
   // -------------------------------------------------------------------------
   // useMicrophoneControl({ sendDataChannelMessage })   Task 5.4
+  // Tri-state model: micState is one of 'normal' | 'paused' | 'muted'
   // -------------------------------------------------------------------------
 
   function useMicrophoneControl({ sendDataChannelMessage }) {
-    const [muted, setMuted] = useState(false);
-    const [pauseReplies, setPauseReplies] = useState(false);
+    const [micState, setMicState] = useState('normal');
+    // Ref synced via effect — lets async/stale callbacks read current state
+    const micStateRef = useRef('normal');
+    // Remembers what state we were in before muting so unmute can restore it
+    const previousStateRef = useRef('normal');
     const streamRef = useRef(null);
+
+    // Keep ref current on every render
+    useEffect(() => {
+      micStateRef.current = micState;
+    }, [micState]);
 
     // Store the mic MediaStream reference so toggleMute can reach audio tracks
     const setMicStream = useCallback((stream) => {
       streamRef.current = stream;
     }, []);
 
-    // Toggle track.enabled on all audio tracks — hardware mic stays open,
-    // but audio is silenced at the track level
+    // Toggle mute:
+    //   normal/paused → save previousState, disable audio track, set 'muted'
+    //   muted         → enable audio track, restore to previousState (default 'normal')
+    // Uses updater form of setState to avoid stale-closure on micState.
     const toggleMute = useCallback(() => {
       const stream = streamRef.current;
       if (!stream) return;
-      const nextMuted = !muted;
-      stream.getAudioTracks().forEach((track) => { track.enabled = !nextMuted; });
-      setMuted(nextMuted);
-    }, [muted]);
+      setMicState((prev) => {
+        if (prev === 'muted') {
+          // Unmute: re-enable track, restore prior state
+          stream.getAudioTracks().forEach((track) => { track.enabled = true; });
+          return previousStateRef.current || 'normal';
+        } else {
+          // Mute: save current state, disable track
+          previousStateRef.current = prev;
+          stream.getAudioTracks().forEach((track) => { track.enabled = false; });
+          return 'muted';
+        }
+      });
+    }, []);
 
-    // Pause: prevent the model from auto-responding (disable create_response)
-    // Uses GA API nested path: session.audio.input.turn_detection (not beta flat path)
+    // Pause: if currently muted, unmute mic first (re-enable audio track),
+    // then send session.update with create_response: false and set state 'paused'.
+    // Uses GA API nested path: session.audio.input.turn_detection (not beta flat path).
     const enterPauseReplies = useCallback(() => {
-      setPauseReplies(true);
+      const stream = streamRef.current;
+      if (micStateRef.current === 'muted' && stream) {
+        stream.getAudioTracks().forEach((track) => { track.enabled = true; });
+      }
       sendDataChannelMessage({
         type: 'session.update',
         session: {
+          type: 'realtime',
           audio: { input: { turn_detection: { type: 'server_vad', create_response: false } } },
         },
       });
+      setMicState('paused');
     }, [sendDataChannelMessage]);
 
-    // Resume: re-enable auto-responses
+    // Resume: send session.update with create_response: true, set state 'normal'
     const exitPauseReplies = useCallback(() => {
-      setPauseReplies(false);
       sendDataChannelMessage({
         type: 'session.update',
         session: {
+          type: 'realtime',
           audio: { input: { turn_detection: { type: 'server_vad', create_response: true } } },
         },
       });
+      setMicState('normal');
     }, [sendDataChannelMessage]);
 
-    return { muted, pauseReplies, toggleMute, enterPauseReplies, exitPauseReplies, setMicStream };
+    // One-shot response while paused — useful to get an answer without fully resuming
+    const triggerResponse = useCallback(() => {
+      sendDataChannelMessage({ type: 'response.create' });
+    }, [sendDataChannelMessage]);
+
+    // Derived booleans for backward compatibility
+    const muted = micState === 'muted';
+    const pauseReplies = micState === 'paused';
+
+    return { micState, muted, pauseReplies, toggleMute, enterPauseReplies, exitPauseReplies, triggerResponse, setMicStream };
   }
 
   // -------------------------------------------------------------------------
@@ -1828,17 +1970,18 @@ body {
   }
 
   // -------------------------------------------------------------------------
-  // MicrophoneControls({ muted, pauseReplies, onToggleMute,
-  //                      onPauseReplies, onResumeReplies })   Task 5.6
-  // Two buttons: mic mute toggle (red when muted) and pause/resume toggle
-  // (amber when paused).
+  // MicrophoneControls({ micState, muted, pauseReplies, onToggleMute,
+  //                      onPauseReplies, onResumeReplies,
+  //                      onTriggerResponse })   Task 5.6
+  // Tri-state aware: normal (green mic), paused (amber), muted (red).
+  // Shows a one-shot "Respond" button only while in 'paused' state.
   // -------------------------------------------------------------------------
 
-  function MicrophoneControls({ muted, pauseReplies, onToggleMute, onPauseReplies, onResumeReplies }) {
+  function MicrophoneControls({ micState, muted, pauseReplies, onToggleMute, onPauseReplies, onResumeReplies, onTriggerResponse }) {
     return html`
       <div class="mic-controls">
         <button
-          class=${'btn btn-mic' + (muted ? ' muted' : '')}
+          class=${'btn btn-mic' + (muted ? ' muted' : (micState === 'normal' ? ' normal' : ''))}
           onClick=${onToggleMute}
           title=${muted ? 'Unmute microphone' : 'Mute microphone'}
         >
@@ -1851,6 +1994,15 @@ body {
         >
           ${pauseReplies ? '▶️ Resume' : '⏸️ Pause'}
         </button>
+        ${pauseReplies && html`
+          <button
+            class="btn btn-respond"
+            onClick=${onTriggerResponse}
+            title="Get one response without fully resuming"
+          >
+            💬 Respond
+          </button>
+        `}
       </div>
     `;
   }
@@ -1893,7 +2045,7 @@ body {
     const handleResumeRef = useRef(null);
 
     // Task 5.5: poll connection health every 5s
-    const healthStatus = useConnectionHealth({
+    const { status: healthStatus } = useConnectionHealth({
       manager: healthManagerRef.current,
       onProactiveReconnect: useCallback(() => {
         console.debug('[VoiceApp] Proactive reconnect triggered by session_limit warning');
@@ -1940,20 +2092,32 @@ body {
 
     const handleStateChange = useCallback((state) => {
       console.debug('[VoiceApp] RTC state changed:', state);  // Task 5.3
+      // End session on unexpected disconnect (ICE failure, network drop, etc.)
+      if (state === 'disconnected' && healthManagerRef.current) {
+        const reason = healthManagerRef.current.analyzeDisconnectReason();
+        healthManagerRef.current.endSession(reason);
+      }
     }, []);
 
     const { rtcState, secureContextError, connect, disconnect, sendDataChannelMessage, streamRef } = useWebRTC({
       onMessage: stableMsgHandler,
       onStateChange: handleStateChange,
+      onIceStateChange: useCallback((iceState) => {
+        if (healthManagerRef.current) {
+          healthManagerRef.current.recordConnectionState(iceState);
+        }
+      }, []),
     });
 
-    // Task 5.4: microphone mute + pause-replies control
+    // Task 5.4: microphone mute + pause-replies control (tri-state)
     const {
+      micState,
       muted,
       pauseReplies,
       toggleMute,
       enterPauseReplies,
       exitPauseReplies,
+      triggerResponse,
       setMicStream,
     } = useMicrophoneControl({ sendDataChannelMessage });
 
@@ -2171,6 +2335,10 @@ body {
     }, [connect, disconnect, setMicStream, streamRef]);
 
     const handleDisconnect = useCallback(async () => {
+      // Record user-initiated disconnect before tearing down
+      if (healthManagerRef.current) {
+        healthManagerRef.current.endSession('user_initiated');
+      }
       // Sync any remaining transcript entries before tearing down the session
       // so the last few messages are persisted even on a clean disconnect.
       await syncTranscript();
@@ -2297,11 +2465,13 @@ body {
 
         ${rtcState === 'connected' && html`
           <${MicrophoneControls}
+            micState=${micState}
             muted=${muted}
             pauseReplies=${pauseReplies}
             onToggleMute=${toggleMute}
             onPauseReplies=${enterPauseReplies}
             onResumeReplies=${exitPauseReplies}
+            onTriggerResponse=${triggerResponse}
           />
           <${ConnectionHealthPanel}
             status=${healthStatus}

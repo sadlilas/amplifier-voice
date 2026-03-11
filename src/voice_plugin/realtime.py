@@ -29,23 +29,26 @@ class VoiceConfig:
     openai_api_key: str = ""
 
 
-async def create_client_secret(config: VoiceConfig) -> str:
+async def create_client_secret(config: VoiceConfig) -> dict[str, Any]:
     """Create an ephemeral client secret via the GA Realtime API.
 
-    Returns the ephemeral token string (e.g. 'ek_...').
+    Returns ``{"client_secret": {"value": "ek_..."}, "session_id": "sess_..."}``.
     """
     headers = {
         "Authorization": f"Bearer {config.openai_api_key}",
         "Content-Type": "application/json",
     }
-    payload = {
+    payload: dict[str, Any] = {
         "session": {
             "type": "realtime",
             "model": config.model,
             "instructions": config.instructions,
-            "tools": config.tools,
         }
     }
+    # Only include tools if non-empty; voice is set via session.update
+    # on the data channel, not at client_secrets creation time.
+    if config.tools:
+        payload["session"]["tools"] = config.tools
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -55,14 +58,29 @@ async def create_client_secret(config: VoiceConfig) -> str:
         )
 
     if resp.is_error:
+        import logging
+
+        logging.getLogger(__name__).error(
+            "create_client_secret failed %s: %s", resp.status_code, resp.text
+        )
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     data = resp.json()
-    return data["value"]
+    return {
+        "client_secret": {"value": data["value"]},
+        "session_id": data.get("id", "unknown"),
+    }
 
 
-async def exchange_sdp(sdp_offer: str, ephemeral_token: str, model: str) -> str:
-    """Exchange WebRTC SDP offer for an answer via the GA Realtime API."""
+async def exchange_sdp(
+    sdp_offer: str, ephemeral_token: str, model: str
+) -> dict[str, str]:
+    """Exchange WebRTC SDP offer for an answer via the GA Realtime API.
+
+    Returns ``{"sdp": "<answer>", "call_id": "<id>"}``.  The *call_id* is
+    extracted from the ``Location`` response header and identifies the
+    WebRTC call for sideband connections.
+    """
     headers = {
         "Authorization": f"Bearer {ephemeral_token}",
         "Content-Type": "application/sdp",
@@ -76,7 +94,12 @@ async def exchange_sdp(sdp_offer: str, ephemeral_token: str, model: str) -> str:
             params={"model": model},
         )
 
-    if resp.is_error:
+    # The GA API may return 200 or 201 for SDP exchanges.
+    if resp.status_code not in (200, 201):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
-    return resp.text
+    # Extract call_id from the Location header (e.g. ".../calls/<call_id>")
+    location = resp.headers.get("location", "")
+    call_id = location.split("/")[-1] if location else ""
+
+    return {"sdp": resp.text, "call_id": call_id}
